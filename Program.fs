@@ -1,4 +1,4 @@
-﻿namespace MonoGame004
+﻿namespace MonoGame005
 
 module Program =
 

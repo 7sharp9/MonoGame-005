@@ -543,5 +543,6 @@ type Game5 () as this =
         this.GraphicsDevice.Clear Color.CornflowerBlue
         spriteBatch.Begin(SpriteSortMode.Deferred, BlendState.AlphaBlend, SamplerState.PointClamp, transformMatrix = Nullable.op_Implicit camera.WorldToScreen)
         TileLayer.draw(spriteBatch, tileSet, camera, tileLayer, this)
+        AnimatedSprite.draw player gameTime spriteBatch
         spriteBatch.End()
         base.Draw(gameTime)

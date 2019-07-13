@@ -4,6 +4,52 @@ open Microsoft.Xna.Framework
 open Microsoft.Xna.Framework.Graphics
 open Microsoft.Xna.Framework.Input
 open System
+open MonoGame.Extended
+
+type AABB =
+    { halfExtents: Vector2
+      center: Vector2 }
+
+    //calculated properties, these could be calculated in the create methods
+    ///aka top left
+    member this.min =
+        Vector2(this.center.X - this.halfExtents.X, this.center.Y - this.halfExtents.Y)
+     ///aka bottom right
+    member this.max =
+        Vector2(this.center.X + this.halfExtents.X, this.center.Y + this.halfExtents.Y)
+    member this.size =
+        Vector2(this.halfExtents.X * 2.f, this.halfExtents.Y * 2.f)
+    static member create(center, halfExtents) =
+        { center = center; halfExtents = halfExtents }
+
+type RigidBody =
+    { mass: float32
+      inverseMass: float32
+      aabb: AABB
+      velocity: Vector2
+      onGround: bool
+      onGroundLast: bool
+    }
+    static member create (mass, width, height, center, vel) =
+        {   mass = mass
+            inverseMass = if mass = 0.f then 0.f else 1.f / mass
+            aabb = {center = center; halfExtents = Vector2(width/2.f, height/2.f) }
+            velocity = vel
+            onGround = false
+            onGroundLast = false }
+
+type Contact =
+    { a: RigidBody
+      b: RigidBody
+      normal: Vector2
+      distance: float32
+      impulse: float32 }
+    static member create(a, b, normal, dist, ?impulse) =
+        {   a = a
+            b = b
+            normal = normal
+            distance = dist
+            impulse = Option.defaultValue 0.f impulse }
 
 type Sprite =
     {position: Vector2; speed: float32; texture: Texture2D; size: Point; offset: Point}
@@ -57,12 +103,8 @@ module Animation =
 type AnimationKey =
     | IdleLeft
     | IdleRight
-    | IdleDown
-    | IdleUp
     | WalkLeft
     | WalkRight
-    | WalkDown
-    | WalkUp
 
 type AnimatedSprite =
     {   texture: Texture2D
@@ -70,7 +112,8 @@ type AnimatedSprite =
         currentAnimationKey: AnimationKey
         isAnimating: bool
         speed: float32
-        position: Vector2 }
+        jump: float32
+        rigidBody: RigidBody }
     member this.CurrentAnimation = this.animations.[this.currentAnimationKey]
     member this.Size with get() = this.CurrentAnimation.size
 
@@ -85,15 +128,22 @@ module AnimatedSprite =
         if animatedSprite.isAnimating then
             animation |> Animation.update gameTime
         else animation
-        
-    let draw (animSprite: AnimatedSprite) (gameTime: GameTime) (sb: SpriteBatch) =
-        sb.Draw(animSprite.texture, animSprite.position, Nullable.op_Implicit animSprite.CurrentAnimation.CurrentFrame, Color.White)
 
+    let draw (animSprite: AnimatedSprite) (gameTime: GameTime) (sb: SpriteBatch) =
+        sb.Draw(animSprite.texture, animSprite.rigidBody.aabb.min - Vector2(8.f, 13.f), Nullable.op_Implicit animSprite.CurrentAnimation.CurrentFrame, Color.White)
+        
 [<AutoOpen>]
 module MonoGameExtensions =
     type Viewport with
         member this.Center =
             Vector2(float32 this.Width * 0.5f, float32 this.Height * 0.5f)
+
+    type Vector2 with
+        member this.MajorAxis() =
+            if abs this.X > abs this.Y then
+                Vector2(float32 (sign this.X), 0.f)
+            else
+                Vector2(0.f, float32 (sign this.Y))
 
 type Camera(viewport: Viewport) =       
     member val WorldToScreen = Matrix.Identity with get, set
@@ -120,10 +170,10 @@ type TileSet =
       sourceRectangles: Rectangle array }
 
 module TileSet =
-  let createTileSet(tileswide, tileshigh,  tileheight, tilewidth, texture) =
+    let createTileSet(tileswide, tileshigh,  tileheight, tilewidth, texture) =
       let sourceRectangles =
-          [| for y in 0..tileshigh-1 do
-               for x in 0..tileswide-1 do
+           [| for y in 0..tileshigh-1 do
+                for x in 0..tileswide-1 do
                     yield Rectangle(x * tilewidth, y * tileheight, tilewidth, tileheight) |]
 
       { tilesWide = tileswide
@@ -132,6 +182,15 @@ module TileSet =
         tileHeight = tileheight
         texture = texture
         sourceRectangles = sourceRectangles }
+
+    let tileToWorld x y (tileSet: TileSet) =
+        Vector2(float32 (x * tileSet.tileWidth), float32 (y * tileSet.tileHeight))
+
+    let toAABB x y (tileSet: TileSet) =
+        let tileInWorld = tileToWorld x y tileSet
+       
+        let extents = Vector2(float32 tileSet.tileWidth / 2.0f, float32  tileSet.tileHeight / 2.0f)
+        AABB.create(tileInWorld + extents, extents)
 
 type TileLayer = { tiles: int array
                    width: int
@@ -171,16 +230,136 @@ module TileLayer =
         
         let minX, minY =  max 0 (cameraPoint.X - 1), max 0 (cameraPoint.Y - 1)
         let maxX, maxY =  min (viewPoint.X + 1) layer.width - 1, min (viewPoint.Y + 1) layer.height - 1
-
+    
         for y in minY..maxY do
             for x in minX..maxX do
                 match getTileId x y layer with
                 | None  -> ()
                 | Some tile ->
-                    if tile = -1 then () else
                     let destination = Rectangle(x * tileSet.tileWidth, y * tileSet.tileHeight,
                                                 tileSet.tileWidth, tileSet.tileHeight)
                     spriteBatch.Draw(tileSet.texture, destination, Nullable.op_Implicit tileSet.sourceRectangles.[tile], Color.White)
+
+    let getBroadphaseTiles (tileLayer: TileLayer) (tileSet: TileSet) (min: Vector2) (max: Vector2) = // action (dt: float32) =
+
+        //round down
+        let minX = (int min.X) / tileSet.tileWidth
+        let minY = (int min.Y) / tileSet.tileHeight 
+
+        //round up
+        let maxX = (int (max.X + 0.5f)) / tileSet.tileWidth
+        let maxY = (int (max.Y + 0.5f)) / tileSet.tileHeight
+
+        //get tiles possibly interacting by movable object
+        let broadphaseTiles =
+            [for x in minX..maxX do
+                for y in minY..maxY do
+                    let tileaabb = TileSet.toAABB x y tileSet
+                    let tileId = getTileId x y tileLayer
+                    yield tileId, tileaabb, x, y]
+        broadphaseTiles 
+
+
+module Speculative =
+    let speculativeSolver (dt: float32) (contact: Contact) =
+
+        let normal = -contact.normal
+
+        //get all the relative normal velocity
+        let nv = Vector2.Dot(contact.b.velocity - contact.a.velocity, normal)
+        if nv > 0.f then
+            contact
+        else
+            //remove enough velocity to leave them just touching
+            let remove = nv + (contact.distance / dt)
+
+            //compute impulse
+            let impulse = remove / (contact.a.inverseMass + contact.b.inverseMass)
+
+            //accumulate
+            let newImpulse = min (impulse + contact.impulse) 0.f
+
+            //compute change
+            let change = newImpulse - contact.impulse
+
+            //store accumulated impulse and apply impulse
+            { contact with
+                a = {contact.a with
+                        velocity = contact.a.velocity + change * normal * contact.a.inverseMass}
+                b = {contact.b with
+                        velocity = contact.b.velocity - change * normal * contact.b.inverseMass}
+                impulse = newImpulse }
+
+module Collision =
+    let isInternalCollision (tileX: int) (tileY: int) (normal: Vector2) (tileLayer: TileLayer) =
+        let nextTileX = tileX + int normal.X
+        let nextTileY = tileY + int normal.Y
+        
+        let currentTile = TileLayer.getTileId tileX tileY tileLayer
+        let nextTile    = TileLayer.getTileId nextTileX nextTileY tileLayer
+        
+        match nextTile with None -> false | Some _ -> true
+    
+    let AABBVsAABB (a: RigidBody) (b:RigidBody) tileX tileY (map: TileLayer) =
+        let combinedExtents = b.aabb.halfExtents + a.aabb.halfExtents
+        let delta = b.aabb.center - a.aabb.center
+
+        let normal = delta.MajorAxis() |> Vector2.Negate
+        let planeCentre = (normal * combinedExtents) + b.aabb.center
+            
+        // distance point from plane
+        let planeDelta = a.aabb.center - planeCentre
+        let dist = planeDelta.Dot normal
+
+        let contact = Contact.create(a, b, normal, dist)
+
+        let internalCollision = isInternalCollision tileX tileY normal map
+        not internalCollision, contact
+
+    let collisionResponse (movableObject: RigidBody) (other: RigidBody) (contact: Contact) (dt: float32)  =
+        let friction = 0.4f
+        let solved = Speculative.speculativeSolver dt contact 
+
+        let tangent = solved.normal.PerpendicularCounterClockwise()
+
+        let newVelocity =
+            //compute the tangent velocity, scale by friction, but only x axis
+            if tangent.Y = 0.0f then
+                let tv = solved.a.velocity.Dot(tangent) * friction
+                solved.a.velocity - (tangent * tv)
+            else solved.a.velocity
+        newVelocity, solved.normal.Y < 0.f, contact
+        
+    let innerCollide (tileLayer: TileLayer) (movableObject: RigidBody) (tileAabb: AABB) (tileType: int option) (dt:float32) (x: int) (y: int) =
+        match tileType with
+        | None -> None
+        | tileType ->
+            let tileRigidBody = RigidBody.create(0.f, tileAabb.size.X, tileAabb.size.Y, tileAabb.center, Vector2.Zero)
+            let collision, contact = AABBVsAABB movableObject tileRigidBody x y tileLayer
+
+            if collision then
+                Some (collisionResponse movableObject tileRigidBody contact dt)
+            else None
+
+    let collision (map:TileLayer) (tileSet: TileSet) (rigidBody: RigidBody) (dt: float32) =
+
+        let expand = Vector2(5.f, 5.f)
+        let predictedPos = rigidBody.aabb.center + (rigidBody.velocity * dt)
+
+        //find min/max
+        let mutable min = Vector2.Min(rigidBody.aabb.center, predictedPos)
+        let mutable max = Vector2.Max(rigidBody.aabb.center, predictedPos)
+        
+        //extend by radius
+        min <- min - rigidBody.aabb.halfExtents
+        max <- max + rigidBody.aabb.halfExtents
+        
+        //extend more to deal with being close to boundry
+        min <- min - expand
+        max <- max + expand
+        
+        TileLayer.getBroadphaseTiles map tileSet min max
+        |> List.choose(fun (tileId, tileaabb, x, y) -> innerCollide map rigidBody tileaabb tileId dt x y)
 
 type Game5 () as this =
     inherit Game()
@@ -188,27 +367,17 @@ type Game5 () as this =
     let graphics = new GraphicsDeviceManager(this, PreferredBackBufferWidth = 1920, PreferredBackBufferHeight = 1080)
     let mutable spriteBatch = Unchecked.defaultof<_>
     let mutable playerSpriteSheet = Unchecked.defaultof<Texture2D>
-    let mutable player = Unchecked.defaultof<Sprite>
-    let mutable newPlayer = Unchecked.defaultof<AnimatedSprite>
+    let mutable player = Unchecked.defaultof<AnimatedSprite>
     let mutable playerAnimations = Unchecked.defaultof<_>
     let mutable camera = Unchecked.defaultof<_>
     let mutable tileSet = Unchecked.defaultof<TileSet>
     let mutable tileLayer = Unchecked.defaultof<TileLayer>
     let mutable terrain = Unchecked.defaultof<Texture2D>
+    let gravity = Vector2(0.f, 50.0f)
+    let maxSpeed = 350.f
 
     let (|KeyDown|_|) k (state: KeyboardState) =
         if state.IsKeyDown k then Some() else None
-
-    let getMovementVector = function
-        | KeyDown Keys.W & KeyDown Keys.A -> Vector2(-1.f, -1.f), WalkLeft
-        | KeyDown Keys.W & KeyDown Keys.D -> Vector2(1.f, -1.f), WalkRight
-        | KeyDown Keys.S & KeyDown Keys.A -> Vector2(-1.f, 1.f), WalkLeft
-        | KeyDown Keys.S & KeyDown Keys.D -> Vector2(1.f, 1.f), WalkRight
-        | KeyDown Keys.W -> Vector2(0.f, -1.f), WalkUp
-        | KeyDown Keys.S -> Vector2(0.f, 1.f), WalkDown
-        | KeyDown Keys.A -> Vector2(-1.f, 0.f), WalkLeft
-        | KeyDown Keys.D -> Vector2(1.f, 0.f), WalkRight
-        | _ -> Vector2.Zero, WalkDown
 
     do
         this.Content.RootDirectory <- "Content"
@@ -217,127 +386,156 @@ type Game5 () as this =
     override this.Initialize() =
         let frameSize = Point(64, 64)
         let anims = 
-            [   IdleUp,    Animation.Create(1, 1, frameSize, Point(0, 0))
-                IdleLeft,  Animation.Create(1, 1, frameSize, Point(0, 64))
-                IdleDown,  Animation.Create(1, 1, frameSize, Point(0, 128))
+            [   IdleLeft,  Animation.Create(1, 1, frameSize, Point(0, 64))
                 IdleRight, Animation.Create(1, 1, frameSize, Point(0, 192))
-                WalkUp,    Animation.Create(8, 10, frameSize, Point(64, 0))
                 WalkLeft,  Animation.Create(8, 10, frameSize, Point(64, 64))
-                WalkDown,  Animation.Create(8, 10, frameSize, Point(64, 128))
                 WalkRight, Animation.Create(8, 10, frameSize, Point(64, 192)) ] |> Map.ofList
         playerAnimations <- anims
         camera <- Camera(this.GraphicsDevice.Viewport)
-        terrain <- this.Content.Load<Texture2D>("terrain")
-        tileSet <- TileSet.createTileSet(32, 32, 32, 32, terrain)
+        terrain <- this.Content.Load<Texture2D>("desert")
+        tileSet <- TileSet.createTileSet(4, 4, 64, 64, terrain)
         let tiles =
-            [|  190;189;190;188;190;188;189;189;29;157;157;157;157;157;157;157;157;157;157;157;157;157;157;157;157;157;157;157;157;157;157;157;157;30;189;188;188;188;190;189;190;189;188;190;188;189;190;189;
-                188;189;189;189;189;190;29;157;158;257;258;258;259;0;0;0;65;66;66;66;66;66;66;66;66;66;66;66;66;66;66;66;67;156;65;67;156;157;30;189;190;188;125;125;125;190;189;189;
-                125;190;29;157;157;157;158;257;258;230;290;357;229;261;261;262;129;3;98;163;163;163;161;98;163;162;98;98;98;161;162;98;34;66;35;34;66;67;156;157;157;157;157;157;157;30;188;190;
-                188;29;158;65;66;67;260;230;290;356;354;355;355;356;356;291;0;97;98;98;98;601;98;98;98;601;601;605;98;98;98;98;163;2;130;130;130;131;257;261;258;262;65;66;67;156;30;188;
-                189;126;65;35;98;99;292;353;353;290;357;354;358;290;355;291;0;97;98;98;604;98;505;506;506;506;506;506;507;98;98;98;2;131;257;258;258;258;227;290;293;291;129;3;34;67;124;188;
-                190;126;97;98;98;99;292;354;355;355;290;356;357;354;290;291;0;97;163;163;604;601;537;538;538;538;538;538;539;98;163;98;99;260;227;644;645;645;646;353;356;229;262;97;162;99;124;188;
-                189;126;97;98;162;99;324;195;354;290;354;354;290;355;293;291;0;35;98;98;161;603;569;570;570;570;509;538;540;507;161;98;99;292;644;614;677;677;613;645;645;646;291;97;2;131;124;188;
-                190;126;129;130;3;34;67;289;355;356;293;293;354;358;290;291;65;2;130;3;605;603;601;604;604;605;537;538;538;540;507;98;99;292;676;677;677;677;677;677;677;678;294;97;34;67;124;189;
-                189;61;93;94;97;162;99;292;358;357;357;355;353;354;355;294;97;99;0;129;3;604;602;603;601;601;569;509;538;538;539;161;99;289;708;709;709;582;677;677;677;678;294;97;98;99;124;189;
-                190;188;188;126;97;163;99;289;358;293;353;353;353;357;293;291;129;131;275;277;129;130;130;130;130;130;3;569;570;570;571;98;99;321;325;322;195;708;709;709;709;710;294;97;98;99;124;188;
-                189;190;188;126;97;163;99;292;353;358;356;354;354;194;322;326;0;275;245;244;276;276;276;276;277;0;97;603;2;130;130;3;34;66;66;67;324;322;322;325;322;322;323;97;2;131;124;189;
-                190;189;190;126;97;98;99;321;325;325;325;325;322;323;65;66;67;339;213;371;373;373;308;212;341;65;35;98;99;80;82;129;130;3;161;34;66;66;66;66;66;66;66;35;99;92;62;189;
-                188;190;188;126;97;161;34;66;66;66;66;66;66;66;35;98;99;0;307;373;373;308;308;244;277;129;130;130;131;112;49;81;82;129;3;161;163;2;130;130;130;3;98;2;131;124;190;189;
-                189;189;189;126;97;163;98;98;98;162;2;130;130;130;3;98;34;67;339;340;340;340;340;340;341;77;79;80;81;50;176;177;114;65;35;98;161;99;272;273;274;129;3;34;67;156;30;190;
-                190;190;188;126;129;3;161;98;98;98;99;269;270;271;129;3;98;99;65;66;66;66;67;0;77;47;111;144;18;176;113;178;114;97;98;2;3;99;304;305;241;274;97;163;34;67;156;30;
-                189;190;189;61;94;129;3;98;98;98;99;301;302;238;271;129;130;3;35;98;98;98;34;67;109;110;46;79;144;18;113;178;114;97;98;34;35;99;304;305;305;306;97;163;98;34;67;124;
-                188;189;188;188;61;94;97;162;98;98;99;301;302;302;238;271;0;129;130;130;3;98;98;99;109;110;173;46;79;144;18;176;114;129;3;98;2;131;304;305;305;306;129;3;163;161;99;124;
-                188;190;188;189;189;126;129;3;98;98;99;333;207;302;302;238;270;270;270;271;129;130;3;99;141;142;142;15;46;79;112;176;49;82;97;98;34;67;336;210;305;306;65;35;98;98;99;124;
-                190;190;189;190;189;61;94;129;3;98;34;67;333;207;302;302;302;302;302;238;270;271;129;131;65;67;0;141;15;111;144;18;113;114;129;3;98;34;67;304;305;306;129;3;98;2;131;124;
-                188;188;190;189;190;190;61;94;97;98;98;99;0;333;207;302;302;302;302;302;302;238;270;271;97;34;66;67;109;46;79;112;176;49;82;129;3;98;99;336;210;241;274;97;163;99;92;62;
-                188;188;189;189;189;188;188;126;97;98;98;34;67;0;301;302;302;302;302;302;302;302;302;303;97;98;2;131;109;175;111;112;113;113;49;82;129;3;34;67;304;305;306;129;3;99;124;190;
-                188;189;189;29;157;157;157;158;97;161;605;98;34;67;333;334;334;207;302;302;302;302;206;335;97;98;34;67;109;174;111;112;113;177;177;114;0;129;3;99;336;210;241;274;97;99;124;188;
-                189;189;190;126;65;66;66;66;35;98;163;98;98;34;66;66;67;333;334;334;334;207;303;65;35;161;98;99;141;15;111;144;145;18;178;49;82;65;35;34;67;304;305;306;97;99;124;189;
-                189;188;189;126;129;3;163;98;161;162;161;163;162;98;163;98;34;66;66;66;67;333;335;97;98;163;98;99;0;109;46;78;79;112;178;176;114;97;98;98;99;336;337;338;97;99;124;188;
-                190;190;190;61;94;97;98;163;162;163;163;161;98;161;98;98;98;98;98;98;34;66;66;35;163;161;98;99;77;47;174;174;111;144;18;113;114;97;98;98;34;66;66;66;35;99;124;188;
-                189;188;190;188;126;97;602;162;98;98;98;98;98;98;98;98;98;2;3;98;98;98;98;98;98;98;98;99;109;174;174;174;46;79;144;145;146;97;161;98;161;163;98;672;98;99;124;190;
-                189;189;188;29;158;97;98;98;98;161;163;161;98;162;161;98;161;99;129;130;130;3;161;98;98;98;163;99;141;142;15;174;14;143;65;66;66;35;98;163;98;98;98;704;98;99;124;190;
-                188;189;29;158;65;35;162;601;98;161;163;162;98;98;98;161;98;99;92;93;94;129;130;130;163;98;98;34;66;67;141;142;143;65;35;163;163;2;130;130;130;3;98;98;98;99;124;189;
-                190;188;126;65;35;98;163;163;98;161;162;162;161;2;130;130;130;131;124;188;61;93;93;94;129;130;3;98;98;34;66;67;65;35;98;98;162;99;525;461;526;97;98;98;98;99;124;190;
-                189;188;126;97;162;162;162;162;98;162;98;98;98;99;92;93;93;93;62;188;189;189;189;61;93;94;97;161;98;98;98;34;35;98;163;98;98;99;430;399;428;97;161;162;98;99;124;189;
-                189;190;126;97;98;161;161;161;162;98;162;161;98;99;124;189;189;189;188;188;188;190;190;189;29;158;97;98;98;98;98;98;98;98;161;98;2;131;430;399;428;97;163;98;2;131;124;188;
-                189;188;126;97;163;162;161;162;161;162;163;98;163;99;124;190;190;190;190;189;190;189;214;189;126;65;35;98;98;163;161;98;98;161;98;2;131;525;462;463;428;97;161;98;99;92;62;189;
-                188;188;126;97;98;162;162;161;161;162;162;161;2;131;156;157;30;189;190;190;246;189;190;190;126;97;98;98;98;98;98;98;161;98;2;131;525;462;463;495;428;97;98;161;99;124;189;190;
-                190;189;126;97;163;161;162;163;98;161;163;98;34;66;66;67;124;188;189;189;189;189;189;190;126;97;98;98;162;163;98;98;2;130;131;525;462;492;399;396;558;97;98;98;99;124;189;188;
-                190;188;126;129;130;130;3;162;161;163;163;161;163;161;163;99;124;190;189;189;190;190;189;189;126;97;98;98;98;163;98;2;131;525;461;462;493;492;396;558;65;35;98;163;99;156;30;189;
-                190;189;61;93;93;94;129;130;130;130;130;130;130;130;3;99;156;30;189;189;189;189;190;190;126;97;98;98;98;98;161;99;525;462;493;492;494;431;428;65;35;98;162;98;34;67;124;189;
-                189;190;190;190;190;61;93;93;93;93;93;93;93;94;129;131;92;62;189;190;188;190;189;190;126;97;98;98;98;98;98;99;557;397;397;397;397;397;558;97;163;98;98;163;162;99;124;190;
-                188;190;188;188;189;190;188;188;189;190;188;125;125;61;93;93;62;188;190;188;188;189;189;188;126;97;98;98;603;602;603;34;66;66;66;66;66;66;66;35;98;98;162;98;98;99;124;189;
-                189;189;189;189;190;188;188;189;189;189;188;190;188;190;190;188;188;190;188;190;188;190;188;189;126;129;3;161;572;605;604;98;163;602;98;604;602;601;605;602;2;130;130;130;130;131;124;189;
-                188;190;190;189;190;190;188;189;189;189;190;188;189;190;190;190;188;190;189;190;188;188;188;190;61;94;129;130;130;130;130;130;130;130;130;130;130;130;130;130;131;92;93;93;93;93;62;189;
-                190;189;189;188;188;188;190;190;188;190;188;190;190;188;190;190;189;190;189;189;188;190;188;189;188;61;93;93;93;93;93;93;93;93;93;93;93;93;93;93;93;62;189;188;189;190;189;189;
-                188;190;188;190;189;190;190;189;189;189;188;190;188;190;188;188;190;376;190;189;188;189;374;189;189;188;188;189;190;189;188;188;190;189;190;188;189;188;188;189;188;190;189;189;190;189;189;188
+            [|  0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0
+                0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0
+                0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0
+                0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0
+                1;9;9;9;5;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0
+                0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0
+                0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0
+                0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0
+                0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0
+                0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;1;9;9;9;9;9;9;9;5;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0
+                0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;4;3;3;3;3;3;3;3;6;9;5;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0
+                0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;7;8;8;8;8;8;8;3;3;3;6;5;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0
+                0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;8;8;8;8;14;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0
+                0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0
+                0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;1;9;9;9;9;9;9;9;5;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0
+                0;0;0;1;9;9;9;9;9;9;9;5;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;1;11;3;3;3;3;3;3;3;13;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0
+                0;0;0;4;3;3;3;3;3;3;3;13;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;7;8;8;8;8;8;8;8;8;14;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0
+                0;0;0;7;8;8;8;8;8;8;8;6;10;5;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0
+                0;0;0;0;0;0;0;0;0;0;0;4;3;13;0;0;0;0;0;0;0;0;0;0;0;1;9;5;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0
+                0;0;0;0;0;0;0;0;0;0;0;7;8;14;0;0;0;0;0;0;0;0;0;0;0;7;8;14;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0
+                0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;1;9;5;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0
+                0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;7;8;14;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0
+                0;0;0;0;0;0;0;0;0;0;1;9;9;9;9;5;0;0;0;0;0;0;0;0;0;0;1;9;9;9;9;9;9;9;9;9;5;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0
+                0;0;0;0;0;1;9;5;0;0;4;3;3;3;3;6;9;5;0;0;0;0;0;0;0;0;4;3;3;3;3;3;3;3;3;3;6;5;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0
+                0;0;0;0;0;4;3;13;0;0;7;8;8;3;3;3;3;13;0;0;0;0;0;0;0;0;7;8;8;8;8;8;8;8;3;3;3;13;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0
+                0;0;0;0;0;7;8;14;0;0;0;0;0;7;8;8;8;14;0;0;1;9;5;0;0;0;0;0;0;0;0;0;0;0;7;8;8;14;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0
+                0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0
+                9;9;9;9;9;9;9;9;9;9;9;9;9;9;9;9;9;9;9;9;9;9;9;9;9;9;9;9;9;9;9;9;9;9;9;9;9;9;9;9;9;9;9;9;9;9;9;9;9;9;9;9;9;9;9;9;9;9;9;9
         |]
 
         tileLayer <- { tiles = tiles
-                       width = 48
-                       height = 42
+                       width = 60
+                       height = 28
                        visible = true }
         base.Initialize()
 
     override this.LoadContent() =
         spriteBatch <- new SpriteBatch(this.GraphicsDevice)
         playerSpriteSheet <- this.Content.Load<Texture2D>("skeleton")
-        player <- { position = Vector2.Zero
-                    speed= 166.f
-                    texture = playerSpriteSheet
-                    size = Point(64, 64)
-                    offset = Point(0,128) }
 
-        newPlayer <- {  texture = playerSpriteSheet
-                        animations = playerAnimations
-                        currentAnimationKey = AnimationKey.IdleDown
-                        isAnimating = false
-                        speed = 166.f
-                        position = Vector2( float32 (tileLayer.width * tileSet.tileWidth) / 2.f, float32 (tileLayer.height * tileSet.tileHeight) / 2.f) }
+        let body = RigidBody.create(60.f, 48.f, 48.f, Vector2.Zero, Vector2.Zero)
+        player <- {  texture = playerSpriteSheet
+                     animations = playerAnimations
+                     currentAnimationKey = IdleRight
+                     isAnimating = false
+                     speed = 166.f
+                     jump = 600.f
+                     rigidBody = body }
 
     override this.Update (gameTime) =
         if (GamePad.GetState(PlayerIndex.One).Buttons.Back = ButtonState.Pressed || Keyboard.GetState().IsKeyDown(Keys.Escape))
         then this.Exit()
 
+        let dt = float32 gameTime.ElapsedGameTime.TotalSeconds
+
         let walkingToIdle = function
-            | WalkUp -> IdleUp
             | WalkLeft -> IdleLeft
-            | WalkDown -> IdleDown
             | WalkRight -> IdleRight
             | otherIdle -> otherIdle
 
-        let movementVector, isMoving, animationKey =
-            let movementVector, animationKey = getMovementVector(Keyboard.GetState())
-            if movementVector = Vector2.Zero then
-                movementVector, false, walkingToIdle newPlayer.currentAnimationKey
-            else movementVector |> Vector2.Normalize, true, animationKey
+        let movementVelocity, isMoving, animationKey =
+            let movementVelocity, animationKey =
+                let xVelocity, yVelocity =
+                    if player.rigidBody.onGround then
+                        player.speed, -player.jump
+                    else player.speed / 10.f, 0.f
+                match Keyboard.GetState() with
+                | KeyDown Keys.W & KeyDown Keys.A ->
+                    Vector2(-xVelocity, yVelocity), IdleLeft
+                | KeyDown Keys.W & KeyDown Keys.D ->
+                    Vector2(xVelocity, yVelocity), IdleRight
+                | KeyDown Keys.W ->
+                    Vector2(0.f, yVelocity), player.currentAnimationKey
+                | KeyDown Keys.A ->
+                    Vector2(-xVelocity, 0.f), WalkLeft
+                | KeyDown Keys.D ->
+                    Vector2(xVelocity, 0.f), WalkRight
+                | _ ->
+                    Vector2.Zero, player.currentAnimationKey
             
-        let newPosition player =
-            let newPos =
-                player.position + movementVector * player.speed * float32 gameTime.ElapsedGameTime.TotalSeconds
-            
-            let minClamp = Vector2.Zero
-            
-            let maxClamp =
-                Vector2(float32 (tileLayer.width * tileSet.tileWidth) - float32 player.Size.X,
-                        float32 (tileLayer.height * tileSet.tileHeight) - float32 player.Size.Y)
-            
-            Vector2.Clamp(newPos, minClamp, maxClamp)      
+            let isMoving = movementVelocity <> Vector2.Zero
+
+            let animation =
+                if player.rigidBody.onGround then 
+                    if isMoving then animationKey
+                    else walkingToIdle animationKey 
+                else
+                    if isMoving then walkingToIdle animationKey 
+                    else walkingToIdle player.currentAnimationKey
+
+            movementVelocity, isMoving, animation
 
         let newAnimation =
-            if newPlayer.currentAnimationKey = animationKey then
-                newPlayer |> AnimatedSprite.updateAnimation animationKey gameTime
+            if player.currentAnimationKey = animationKey then
+                player |> AnimatedSprite.updateAnimation animationKey gameTime
             else
-                newPlayer |> AnimatedSprite.resetAnimation animationKey
+                player |> AnimatedSprite.resetAnimation animationKey
 
-        newPlayer <- { newPlayer with
-                        position = newPosition newPlayer
+        //update players volocity due to movement and gravity
+        let movementAndGravityVelocity =
+            let velocity = player.rigidBody.velocity + movementVelocity + gravity
+            //clamp max speed to ±maxspeed for x, ±maxspeed*2 for y
+            Vector2.Clamp(velocity, Vector2(-maxSpeed, -maxSpeed * 4.f), Vector2(maxSpeed, maxSpeed * 2.f))
+
+        let rbUpdated = {player.rigidBody with
+                            onGround = false
+                            onGroundLast = player.rigidBody.onGround
+                            velocity = movementAndGravityVelocity }
+
+        //do world collision between player and map
+        let afterCollisionVelocity, onGround, onGroundLast =
+            Collision.collision tileLayer tileSet rbUpdated dt
+            |> List.sortBy (fun (_,_,c) -> c.distance)
+            |> List.tryHead
+            |> function
+               | None ->
+                    rbUpdated.velocity, rbUpdated.onGround, rbUpdated.onGroundLast
+               | Some (velocity, onGround, contact) ->
+                    velocity, onGround, rbUpdated.onGroundLast
+
+        //integrate velocity into position
+        let newPosition =
+            let maxClamp =
+                Vector2(float32 (tileLayer.width * tileSet.tileWidth) - float32 player.rigidBody.aabb.halfExtents.X,
+                        float32 (tileLayer.height * tileSet.tileHeight) - float32 player.rigidBody.aabb.halfExtents.Y)
+
+            let pos = player.rigidBody.aabb.center + (afterCollisionVelocity * dt)
+            Vector2.Clamp(pos, player.rigidBody.aabb.halfExtents, maxClamp)
+
+        player <- { player with
+                        rigidBody =
+                            {player.rigidBody with
+                                velocity = afterCollisionVelocity
+                                aabb = { player.rigidBody.aabb with center = newPosition }
+                                onGround = onGround
+                                onGroundLast = onGroundLast }
                         isAnimating = isMoving
                         currentAnimationKey = animationKey
-                        animations = newPlayer.animations |> Map.add animationKey newAnimation }
+                        animations = player.animations |> Map.add animationKey newAnimation }
 
-        camera.Update newPlayer.position
+        camera.Update player.rigidBody.aabb.center
 
         base.Update(gameTime)
 
@@ -345,7 +543,5 @@ type Game5 () as this =
         this.GraphicsDevice.Clear Color.CornflowerBlue
         spriteBatch.Begin(SpriteSortMode.Deferred, BlendState.AlphaBlend, SamplerState.PointClamp, transformMatrix = Nullable.op_Implicit camera.WorldToScreen)
         TileLayer.draw(spriteBatch, tileSet, camera, tileLayer, this)
-        player.Draw(spriteBatch)
-        AnimatedSprite.draw newPlayer gameTime spriteBatch
         spriteBatch.End()
         base.Draw(gameTime)

@@ -544,5 +544,7 @@ type Game5 () as this =
         spriteBatch.Begin(SpriteSortMode.Deferred, BlendState.AlphaBlend, SamplerState.PointClamp, transformMatrix = Nullable.op_Implicit camera.WorldToScreen)
         TileLayer.draw(spriteBatch, tileSet, camera, tileLayer, this)
         AnimatedSprite.draw player gameTime spriteBatch
+        //let playeraabb = Rectangle(player.rigidBody.aabb.min.ToPoint(), player.rigidBody.aabb.size.ToPoint()).ToRectangleF()
+        //spriteBatch.DrawRectangle(playeraabb, Color.Blue)
         spriteBatch.End()
         base.Draw(gameTime)

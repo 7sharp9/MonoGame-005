@@ -290,6 +290,12 @@ module Speculative =
                         velocity = contact.b.velocity - change * normal * contact.b.inverseMass}
                 impulse = newImpulse }
 
+    // let solveN (iterations: int) (dt: float32) (solver: float32 -> Contact -> Contact) (contacts: Contact list)=
+    //     let rec loop n f arg =
+    //         if n = 0 then arg
+    //         else loop (n-1) f (f arg)
+    //     contacts |> List.map (loop iterations (solver dt))
+
 module Collision =
     let isInternalCollision (tileX: int) (tileY: int) (normal: Vector2) (tileLayer: TileLayer) =
         let nextTileX = tileX + int normal.X
